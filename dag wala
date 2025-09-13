@@ -1,0 +1,191 @@
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Optional, List
+import pandas as pd
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+from airflow.models import Variable
+from datetime import timedelta
+import requests
+
+os.environ['KAGGLE_USERNAME'] = 'studenticse'
+os.environ['KAGGLE_KEY'] = '2d1b6a3a4a990f35a55cd3b6bf6b7ee5'
+
+class Extract:
+    def __init__(
+        self,
+        dataset: str = "sobhanmoosavi/us-accidents",
+        extract_dir: str = r"C:\Users\user\spark-4.0.1-bin-hadoop3\Airflow\Output",
+        delete_zip_after_unzip: bool = True,
+        encoding: str = "utf-8",
+        verbose: bool = True,
+    ):
+        self.dataset = dataset
+        self.extract_dir = Path(extract_dir)
+        self.extract_dir.mkdir(parents=True, exist_ok=True)
+        self.delete_zip_after_unzip = delete_zip_after_unzip
+        self.encoding = encoding
+        self.verbose = verbose
+
+        # 1) Check Kaggle CLI
+        if shutil.which("kaggle") is None:
+            raise EnvironmentError(
+                "Kaggle CLI not found. Install with 'pip install kaggle' and ensure 'kaggle' is on PATH.\n"
+               
+            )
+
+        # 2) If no CSV yet, download and unzip
+        if not self._has_csv_in_dir():
+            if self.verbose:
+                print(f"Downloading {self.dataset} to: {self.extract_dir}")
+            cmd = [
+                "kaggle", "datasets", "download",
+                "-d", self.dataset,
+                "-p", str(self.extract_dir),
+                "--unzip"
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode != 0:
+                raise RuntimeError(
+                    "Kaggle download failed.\n"
+                    f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}\n\n"
+                    "Check Kaggle credentials and dataset slug."
+                )
+
+            if self.verbose:
+                print("Download and unzip complete.")
+
+            if self.delete_zip_after_unzip:
+                for z in self.extract_dir.glob("*.zip"):
+                    try:
+                        z.unlink()
+                    except Exception:
+                        pass
+
+        # 3) Locate the US Accidents CSV
+        csv_path = self._find_accidents_csv()
+        if not csv_path:
+            raise FileNotFoundError(
+                f"No US_Accidents*.csv found in {self.extract_dir}. "
+                "Please verify the dataset contents."
+            )
+
+        self.csv_path = str(csv_path)
+        if self.verbose:
+            print(f"Using CSV: {self.csv_path}")
+
+        # 4) Load the CSV with a robust fallback for encoding
+        try:
+            self.df = pd.read_csv(self.csv_path, encoding=self.encoding, low_memory=False)
+        except UnicodeDecodeError:
+            # Try a BOM-aware encoding if the first attempt fails
+            self.df = pd.read_csv(self.csv_path, encoding="utf-8-sig", low_memory=False)
+
+    # ----------------- NEW: helper methods that were missing -----------------
+
+    def _has_csv_in_dir(self) -> bool:
+        """
+        Returns True if any CSV that looks like the US Accidents dataset exists in extract_dir.
+        """
+        patterns: List[str] = ["US_Accidents*.csv", "*.csv"]
+        for pat in patterns:
+            if any(self.extract_dir.glob(pat)):
+                return True
+        return False
+
+    def _find_accidents_csv(self) -> Optional[Path]:
+        """
+        Returns a Path to the first CSV found (prefer US_Accidents*.csv).
+        """
+        preferred = sorted(self.extract_dir.glob("US_Accidents*.csv"))
+        if preferred:
+            # If multiple versions exist, pick the newest by name (rough heuristic)
+            return preferred[-1]
+        # Fallback to any CSV
+        any_csv = sorted(self.extract_dir.glob("*.csv"))
+        return any_csv[-1] if any_csv else None
+
+
+if __name__ == "__main__":
+    extract = Extract(
+        dataset="sobhanmoosavi/us-accidents",
+        extract_dir=r"C:\Users\user\spark-4.0.1-bin-hadoop3\Airflow\Output",
+        delete_zip_after_unzip=True,
+        encoding="utf-8",
+        verbose=True,
+    )
+
+    # Example: show the first 5 rows to confirm data loaded
+    print(extract.df.head())
+
+def upload_csv_to_airflow():
+    source_path = r"C:\Users\user\spark-4.0.1-bin-hadoop3\Airflow\Output\US_Accidents.csv"
+    airflow_data_dir = "/opt/airflow/data"  # Adjust this path based on your Airflow setup
+    os.makedirs(airflow_data_dir, exist_ok=True)
+    shutil.copy(source_path, os.path.join(airflow_data_dir, "US_Accidents.csv"))
+    print(f"CSV uploaded to {airflow_data_dir}")
+
+#---------------------------------------------------------------------------
+
+default_args = {
+    "owner": "airflow",
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+def upload_csv_to_airflow():
+    source_path = r"C:\Users\user\spark-4.0.1-bin-hadoop3\Airflow\Output\US_Accidents.csv"
+    airflow_data_dir = "/opt/airflow/data"  # Adjust this path based on your Airflow setup
+    os.makedirs(airflow_data_dir, exist_ok=True)
+    shutil.copy(source_path, os.path.join(airflow_data_dir, "US_Accidents.csv"))
+    print(f"CSV uploaded to {airflow_data_dir}")
+
+def fetch_us_accidents_data():
+    # You can call your Extract class here if needed
+    extract = Extract(
+        dataset="sobhanmoosavi/us-accidents",
+        extract_dir=r"C:\Users\user\spark-4.0.1-bin-hadoop3\Airflow\Output",
+        delete_zip_after_unzip=True,
+        encoding="utf-8",
+        verbose=True,
+    )
+    print("US Accidents data downloaded and loaded.")
+
+with DAG(
+    dag_id="us_accidents_pipeline",
+    default_args=default_args,
+    description="ETL pipeline for US Accidents data",
+    schedule_interval="@daily",
+    start_date=days_ago(1),
+    catchup=False,
+) as dag:
+
+    # Task 1: Download US Accidents dataset
+    download_task = PythonOperator(
+        task_id="download_us_accidents_data",
+        python_callable=fetch_us_accidents_data,
+    )
+
+    # Task 2: Upload CSV to Airflow-accessible directory
+    upload_csv_task = PythonOperator(
+        task_id="upload_us_accidents_csv",
+        python_callable=upload_csv_to_airflow,
+    )
+
+    # Task 3: Run Spark ETL
+    etl_task = BashOperator(
+        task_id="spark_etl_us_accidents",
+        bash_command=(
+            "spark-submit --master spark://spark-master:7077 "
+            "--jars /opt/airflow/spark_jobs/mysql-connector-j-8.0.33.jar "
+            "/opt/airflow/spark_jobs/etl_us_accidents.py "
+            "/opt/airflow/data/US_Accidents.csv "
+            "jdbc:mysql://mysql:3306/airflow_db "
+            "airflow airflow"
+        ),
+    )
